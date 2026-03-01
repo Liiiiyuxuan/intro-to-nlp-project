@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 import csv
 import json
-import math
 import os
-import random
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -11,26 +9,18 @@ from pathlib import Path
 
 class MyModel:
     """
-    Hybrid next-character model:
-    - Character n-gram backbone
-    - Lightweight neural reranker trained with negative sampling
+    Character-level n-gram model with lightweight two-stage training:
+    1) self-supervised pretraining from raw contexts
+    2) supervised fine-tuning on (context, next-char) targets
     """
 
     MODEL_FILE = 'model.checkpoint'
-    MODEL_VERSION = 8
-    USE_NEURAL_RERANK_AT_INFERENCE = False
+    MODEL_VERSION = 5
 
-    def __init__(self, max_order=8, emb_dim=24, ctx_window=12):
+    def __init__(self, max_order=8):
         self.max_order = max_order
         self.global_counts = Counter()
         self.order_counts = {k: defaultdict(Counter) for k in range(1, self.max_order + 1)}
-
-        # Neural reranker params
-        self.emb_dim = emb_dim
-        self.ctx_window = ctx_window
-        self.char_emb = {}   # char -> [float]
-        self.char_bias = {}  # char -> float
-        self._rng = random.Random(0)
 
     @classmethod
     def _repo_root(cls):
@@ -38,6 +28,11 @@ class MyModel:
 
     @classmethod
     def load_training_data(cls):
+        """
+        Returns a dict with:
+        - labeled: list[(context, next_char)] from input/answer pairs (fine-tuning)
+        - unlabeled: list[context] from input files (self-supervised pretraining)
+        """
         labeled = []
         unlabeled = []
         data_dir = cls._repo_root() / 'data'
@@ -112,11 +107,6 @@ class MyModel:
             for p in preds:
                 f.write(f'{p}\n')
 
-    def _ensure_char(self, ch):
-        if ch not in self.char_emb:
-            self.char_emb[ch] = [self._rng.uniform(-0.05, 0.05) for _ in range(self.emb_dim)]
-            self.char_bias[ch] = 0.0
-
     def _update_counts(self, context, nxt, weight=1.0):
         if not nxt:
             return
@@ -128,114 +118,40 @@ class MyModel:
             self.order_counts[k][suffix][nxt] += weight
 
     def _pretrain_on_contexts(self, contexts, weight=0.2, max_chars=256):
+        """Lightweight pretraining: collect broad character statistics without exploding checkpoint size."""
         for text in contexts:
             if not text:
                 continue
             truncated = text[:max_chars]
             for ch in truncated:
                 self.global_counts[ch] += weight
+
+            # Add a small amount of local transition signal (1-gram suffix only).
             for i in range(1, len(truncated)):
                 prev = truncated[i - 1]
                 nxt = truncated[i]
                 self.order_counts[1][prev][nxt] += weight
 
-    def _ctx_vector(self, context):
-        tail = context[-self.ctx_window:]
-        if not tail:
-            return [0.0] * self.emb_dim
-
-        vec = [0.0] * self.emb_dim
-        used = 0
-        for ch in tail:
-            emb = self.char_emb.get(ch)
-            if emb is None:
-                continue
-            used += 1
-            for i in range(self.emb_dim):
-                vec[i] += emb[i]
-
-        if used == 0:
-            return [0.0] * self.emb_dim
-
-        scale = 1.0 / used
-        for i in range(self.emb_dim):
-            vec[i] *= scale
-        return vec
-
-    def _dot(self, a, b):
-        return sum(x * y for x, y in zip(a, b))
-
-    def _sigmoid(self, x):
-        if x < -40:
-            return 0.0
-        if x > 40:
-            return 1.0
-        return 1.0 / (1.0 + math.exp(-x))
-
-    def _train_neural_reranker(self, labeled, epochs=2, neg_samples=5, lr=0.03):
-        # Build vocabulary from observed outputs and context chars.
-        vocab = set(self.global_counts.keys())
-        for context, nxt in labeled:
-            vocab.add(nxt)
-            for ch in context[-self.ctx_window:]:
-                vocab.add(ch)
-
-        for ch in vocab:
-            self._ensure_char(ch)
-
-        vocab_list = list(vocab)
-        if len(vocab_list) <= 1 or not labeled:
-            return
-
-        for _ in range(epochs):
-            self._rng.shuffle(labeled)
-            for context, true_ch in labeled:
-                self._ensure_char(true_ch)
-                ctx = self._ctx_vector(context)
-
-                # Positive update
-                true_emb = self.char_emb[true_ch]
-                true_score = self._dot(ctx, true_emb) + self.char_bias[true_ch]
-                p = self._sigmoid(true_score)
-                g = (1.0 - p)  # d log sigmoid(x)
-
-                for i in range(self.emb_dim):
-                    true_emb[i] += lr * g * ctx[i]
-                self.char_bias[true_ch] += lr * g
-
-                # Negative samples
-                for _n in range(neg_samples):
-                    neg = self._rng.choice(vocab_list)
-                    if neg == true_ch:
-                        continue
-                    neg_emb = self.char_emb[neg]
-                    neg_score = self._dot(ctx, neg_emb) + self.char_bias[neg]
-                    pn = self._sigmoid(neg_score)
-                    gn = -pn  # d log sigmoid(-x)
-
-                    for i in range(self.emb_dim):
-                        neg_emb[i] += lr * gn * ctx[i]
-                    self.char_bias[neg] += lr * gn
-
     def run_train(self, train_data, work_dir):
         labeled = train_data.get('labeled', [])
         unlabeled = train_data.get('unlabeled', [])
 
+        # Stage 1: self-supervised "pretraining" on raw contexts.
         self._pretrain_on_contexts(unlabeled, weight=0.2)
+
+        # Stage 2: supervised fine-tuning on target next-character labels.
         for context, nxt in labeled:
             self._update_counts(context, nxt, weight=1.0)
 
+        # Fallback distribution if no train data is available.
         if not self.global_counts:
             for ch in ' etaoinshrdlucmfwypvbgkqjxz,.!?':
                 self.global_counts[ch] += 1.0
 
-        # Neural fine-tuning stage
-        self._train_neural_reranker(labeled)
-
-    def _ngram_scores(self, context):
+    def _top_guesses(self, context, n=3):
         scores = Counter()
-        max_k = min(self.max_order, len(context))
 
+        max_k = min(self.max_order, len(context))
         for k in range(max_k, 0, -1):
             suffix = context[-k:]
             counts = self.order_counts[k].get(suffix)
@@ -255,45 +171,14 @@ class MyModel:
             for ch, cnt in self.global_counts.items():
                 scores[ch] += 0.15 * (cnt / global_total)
 
-        return scores
+        ranked = [ch for ch, _ in scores.most_common()]
 
-    def _top_guesses(self, context, n=3):
-        ngram_scores = self._ngram_scores(context)
-
-        # Fast path required by course runtime constraints.
-        if not self.USE_NEURAL_RERANK_AT_INFERENCE:
-            ranked = [ch for ch, _ in ngram_scores.most_common(16)]
-            if len(ranked) < n:
-                for ch, _ in self.global_counts.most_common(32):
-                    if ch not in ranked:
-                        ranked.append(ch)
-                    if len(ranked) >= n:
-                        break
-            while len(ranked) < n:
-                ranked.append(' ')
-            return ''.join(ranked[:n])
-
-        # Optional neural rerank path.
-        candidates = [ch for ch, _ in ngram_scores.most_common(32)]
-        for ch, _ in self.global_counts.most_common(32):
-            if ch not in candidates:
-                candidates.append(ch)
-
-        if not candidates:
-            return ' ' * n
-
-        ctx = self._ctx_vector(context)
-        combined = []
-        for ch in candidates:
-            emb = self.char_emb.get(ch)
-            neural = 0.0
-            if emb is not None:
-                neural = self._dot(ctx, emb) + self.char_bias.get(ch, 0.0)
-            score = ngram_scores.get(ch, 0.0) + 0.35 * neural
-            combined.append((score, ch))
-
-        combined.sort(reverse=True)
-        ranked = [ch for _, ch in combined]
+        if len(ranked) < n:
+            for ch, _ in self.global_counts.most_common():
+                if ch not in ranked:
+                    ranked.append(ch)
+                if len(ranked) >= n:
+                    break
 
         while len(ranked) < n:
             ranked.append(' ')
@@ -313,10 +198,6 @@ class MyModel:
                 str(k): {suffix: dict(cnts) for suffix, cnts in suffix_map.items()}
                 for k, suffix_map in self.order_counts.items()
             },
-            'emb_dim': self.emb_dim,
-            'ctx_window': self.ctx_window,
-            'char_emb': self.char_emb,
-            'char_bias': self.char_bias,
         }
         with open(os.path.join(work_dir, self.MODEL_FILE), 'wt', encoding='utf-8') as f:
             json.dump(payload, f)
@@ -343,11 +224,7 @@ class MyModel:
         if payload.get('model_version') != cls.MODEL_VERSION:
             return cls._train_and_save_default(work_dir)
 
-        model = cls(
-            max_order=payload.get('max_order', 8),
-            emb_dim=payload.get('emb_dim', 24),
-            ctx_window=payload.get('ctx_window', 12),
-        )
+        model = cls(max_order=payload.get('max_order', 8))
         model.global_counts.update(payload.get('global_counts', {}))
 
         raw_order_counts = payload.get('order_counts', {})
@@ -355,11 +232,6 @@ class MyModel:
             k = int(key)
             for suffix, cnts in suffix_map.items():
                 model.order_counts[k][suffix].update(cnts)
-
-        for ch, vec in payload.get('char_emb', {}).items():
-            model.char_emb[ch] = [float(v) for v in vec]
-        for ch, b in payload.get('char_bias', {}).items():
-            model.char_bias[ch] = float(b)
 
         return model
 
