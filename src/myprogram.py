@@ -1,7 +1,7 @@
 #!/usr/bin/env python
+import csv
 import json
 import os
-import csv
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -9,11 +9,13 @@ from pathlib import Path
 
 class MyModel:
     """
-    Character-level n-gram model with simple backoff for next-character prediction.
+    Character-level n-gram model with lightweight two-stage training:
+    1) self-supervised pretraining from raw contexts
+    2) supervised fine-tuning on (context, next-char) targets
     """
 
     MODEL_FILE = 'model.checkpoint'
-    MODEL_VERSION = 3
+    MODEL_VERSION = 5
 
     def __init__(self, max_order=8):
         self.max_order = max_order
@@ -27,12 +29,20 @@ class MyModel:
     @classmethod
     def load_training_data(cls):
         """
-        Discover training pairs by finding sibling input/answer files under ./data.
+        Returns a dict with:
+        - labeled: list[(context, next_char)] from input/answer pairs (fine-tuning)
+        - unlabeled: list[context] from input files (self-supervised pretraining)
         """
-        data = []
+        labeled = []
+        unlabeled = []
         data_dir = cls._repo_root() / 'data'
         if not data_dir.is_dir():
-            return data
+            return {'labeled': labeled, 'unlabeled': unlabeled}
+
+        for input_path in sorted(data_dir.glob('**/input*.txt')):
+            with open(input_path, 'rt', encoding='utf-8') as f_in:
+                for context in f_in:
+                    unlabeled.append(context.rstrip('\n'))
 
         for answer_path in sorted(data_dir.glob('**/answer*.txt')):
             input_name = answer_path.name.replace('answer', 'input', 1)
@@ -45,8 +55,9 @@ class MyModel:
                     context = context.rstrip('\n')
                     nxt = nxt.rstrip('\n')
                     if nxt:
-                        data.append((context, nxt[0]))
-        return data
+                        labeled.append((context, nxt[0]))
+
+        return {'labeled': labeled, 'unlabeled': unlabeled}
 
     @classmethod
     def load_test_data(cls, fname):
@@ -87,7 +98,7 @@ class MyModel:
         if fname.lower().endswith('.csv'):
             with open(fname, 'wt', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['id', 'prediction'])
+                writer.writerow(['ID', 'TARGET'])
                 for row_id, pred in zip(ids, preds):
                     writer.writerow([row_id, pred])
             return
@@ -96,23 +107,49 @@ class MyModel:
             for p in preds:
                 f.write(f'{p}\n')
 
-    def run_train(self, data, work_dir):
-        for context, nxt in data:
-            if not nxt:
+    def _update_counts(self, context, nxt, weight=1.0):
+        if not nxt:
+            return
+
+        self.global_counts[nxt] += weight
+        max_k = min(self.max_order, len(context))
+        for k in range(1, max_k + 1):
+            suffix = context[-k:]
+            self.order_counts[k][suffix][nxt] += weight
+
+    def _pretrain_on_contexts(self, contexts, weight=0.2, max_chars=256):
+        """Lightweight pretraining: collect broad character statistics without exploding checkpoint size."""
+        for text in contexts:
+            if not text:
                 continue
-            self.global_counts[nxt] += 1
-            max_k = min(self.max_order, len(context))
-            for k in range(1, max_k + 1):
-                suffix = context[-k:]
-                self.order_counts[k][suffix][nxt] += 1
+            truncated = text[:max_chars]
+            for ch in truncated:
+                self.global_counts[ch] += weight
+
+            # Add a small amount of local transition signal (1-gram suffix only).
+            for i in range(1, len(truncated)):
+                prev = truncated[i - 1]
+                nxt = truncated[i]
+                self.order_counts[1][prev][nxt] += weight
+
+    def run_train(self, train_data, work_dir):
+        labeled = train_data.get('labeled', [])
+        unlabeled = train_data.get('unlabeled', [])
+
+        # Stage 1: self-supervised "pretraining" on raw contexts.
+        self._pretrain_on_contexts(unlabeled, weight=0.2)
+
+        # Stage 2: supervised fine-tuning on target next-character labels.
+        for context, nxt in labeled:
+            self._update_counts(context, nxt, weight=1.0)
 
         # Fallback distribution if no train data is available.
         if not self.global_counts:
             for ch in ' etaoinshrdlucmfwypvbgkqjxz,.!?':
-                self.global_counts[ch] += 1
+                self.global_counts[ch] += 1.0
 
     def _top_guesses(self, context, n=3):
-        ranked = []
+        scores = Counter()
 
         max_k = min(self.max_order, len(context))
         for k in range(max_k, 0, -1):
@@ -120,17 +157,28 @@ class MyModel:
             counts = self.order_counts[k].get(suffix)
             if not counts:
                 continue
-            for ch, _ in counts.most_common():
+
+            total = sum(counts.values())
+            if total <= 0:
+                continue
+
+            order_weight = float(k ** 1.5)
+            for ch, cnt in counts.items():
+                scores[ch] += order_weight * (cnt / total)
+
+        global_total = sum(self.global_counts.values())
+        if global_total > 0:
+            for ch, cnt in self.global_counts.items():
+                scores[ch] += 0.15 * (cnt / global_total)
+
+        ranked = [ch for ch, _ in scores.most_common()]
+
+        if len(ranked) < n:
+            for ch, _ in self.global_counts.most_common():
                 if ch not in ranked:
                     ranked.append(ch)
                 if len(ranked) >= n:
-                    return ''.join(ranked[:n])
-
-        for ch, _ in self.global_counts.most_common():
-            if ch not in ranked:
-                ranked.append(ch)
-            if len(ranked) >= n:
-                break
+                    break
 
         while len(ranked) < n:
             ranked.append(' ')
@@ -171,11 +219,9 @@ class MyModel:
             with open(model_path, 'rt', encoding='utf-8') as f:
                 payload = json.load(f)
         except (json.JSONDecodeError, OSError):
-            # Legacy or corrupted checkpoint: rebuild using current code.
             return cls._train_and_save_default(work_dir)
 
         if payload.get('model_version') != cls.MODEL_VERSION:
-            # Force refresh when model logic changes so predictions reflect code updates.
             return cls._train_and_save_default(work_dir)
 
         model = cls(max_order=payload.get('max_order', 8))
@@ -206,7 +252,10 @@ if __name__ == '__main__':
         model = MyModel()
         print('Loading training data')
         train_data = MyModel.load_training_data()
-        print(f'Training on {len(train_data)} samples')
+        print(
+            f"Pretraining on {len(train_data.get('unlabeled', []))} contexts "
+            f"and fine-tuning on {len(train_data.get('labeled', []))} labeled samples"
+        )
         model.run_train(train_data, args.work_dir)
         print('Saving model')
         model.save(args.work_dir)
