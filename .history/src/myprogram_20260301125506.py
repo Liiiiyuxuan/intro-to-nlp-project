@@ -18,9 +18,9 @@ class MyModel:
 
     MODEL_FILE = 'model.checkpoint'
     MODEL_VERSION = 8
-    USE_NEURAL_RERANK_AT_INFERENCE = True
+    USE_NEURAL_RERANK_AT_INFERENCE = False
 
-    def __init__(self, max_order=16, emb_dim=48, ctx_window=16):
+    def __init__(self, max_order=20, emb_dim=24, ctx_window=20):
         self.max_order = max_order
         self.global_counts = Counter()
         self.order_counts = {k: defaultdict(Counter) for k in range(1, self.max_order + 1)}
