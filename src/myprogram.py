@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import json
 import os
+import csv
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -12,7 +13,7 @@ class MyModel:
     """
 
     MODEL_FILE = 'model.checkpoint'
-    MODEL_VERSION = 2
+    MODEL_VERSION = 3
 
     def __init__(self, max_order=8):
         self.max_order = max_order
@@ -49,14 +50,48 @@ class MyModel:
 
     @classmethod
     def load_test_data(cls, fname):
+        ids = []
         data = []
-        with open(fname, 'rt', encoding='utf-8') as f:
-            for line in f:
-                data.append(line.rstrip('\n'))
-        return data
+
+        if fname.lower().endswith('.csv'):
+            with open(fname, 'rt', encoding='utf-8', newline='') as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames:
+                    return ids, data
+
+                context_key = None
+                for field in reader.fieldnames:
+                    if field and field.upper() != 'ID':
+                        context_key = field
+                        break
+
+                if context_key is None:
+                    raise ValueError('CSV test data must include a non-ID text/context column')
+
+                for i, row in enumerate(reader):
+                    row_id = row.get('ID')
+                    if row_id in (None, ''):
+                        row_id = str(i)
+                    ids.append(str(row_id))
+                    data.append((row.get(context_key) or '').rstrip('\n'))
+        else:
+            with open(fname, 'rt', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    ids.append(str(i))
+                    data.append(line.rstrip('\n'))
+
+        return ids, data
 
     @classmethod
-    def write_pred(cls, preds, fname):
+    def write_pred(cls, ids, preds, fname):
+        if fname.lower().endswith('.csv'):
+            with open(fname, 'wt', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['ID', 'TARGET'])
+                for row_id, pred in zip(ids, preds):
+                    writer.writerow([row_id, pred])
+            return
+
         with open(fname, 'wt', encoding='utf-8') as f:
             for p in preds:
                 f.write(f'{p}\n')
@@ -179,11 +214,11 @@ if __name__ == '__main__':
         print('Loading model')
         model = MyModel.load(args.work_dir)
         print(f'Loading test data from {args.test_data}')
-        test_data = MyModel.load_test_data(args.test_data)
+        test_ids, test_data = MyModel.load_test_data(args.test_data)
         print('Making predictions')
         pred = model.run_pred(test_data)
         print(f'Writing predictions to {args.test_output}')
         assert len(pred) == len(test_data), f'Expected {len(test_data)} predictions but got {len(pred)}'
-        model.write_pred(pred, args.test_output)
+        model.write_pred(test_ids, pred, args.test_output)
     else:
         raise NotImplementedError(f'Unknown mode {args.mode}')
