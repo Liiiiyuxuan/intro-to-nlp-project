@@ -17,7 +17,8 @@ class MyModel:
     """
 
     MODEL_FILE = 'model.checkpoint'
-    MODEL_VERSION = 6
+    MODEL_VERSION = 8
+    USE_NEURAL_RERANK_AT_INFERENCE = False
 
     def __init__(self, max_order=8, emb_dim=24, ctx_window=12):
         self.max_order = max_order
@@ -259,7 +260,20 @@ class MyModel:
     def _top_guesses(self, context, n=3):
         ngram_scores = self._ngram_scores(context)
 
-        # Candidate pool from n-gram + global prior.
+        # Fast path required by course runtime constraints.
+        if not self.USE_NEURAL_RERANK_AT_INFERENCE:
+            ranked = [ch for ch, _ in ngram_scores.most_common(16)]
+            if len(ranked) < n:
+                for ch, _ in self.global_counts.most_common(32):
+                    if ch not in ranked:
+                        ranked.append(ch)
+                    if len(ranked) >= n:
+                        break
+            while len(ranked) < n:
+                ranked.append(' ')
+            return ''.join(ranked[:n])
+
+        # Optional neural rerank path.
         candidates = [ch for ch, _ in ngram_scores.most_common(32)]
         for ch, _ in self.global_counts.most_common(32):
             if ch not in candidates:
