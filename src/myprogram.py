@@ -18,7 +18,7 @@ class MyModel:
 
     MODEL_FILE = 'model.checkpoint'
     MODEL_VERSION = 8
-    USE_NEURAL_RERANK_AT_INFERENCE = True
+    USE_NEURAL_RERANK_AT_INFERENCE = False
 
     def __init__(self, max_order=8, emb_dim=24, ctx_window=12):
         self.max_order = max_order
