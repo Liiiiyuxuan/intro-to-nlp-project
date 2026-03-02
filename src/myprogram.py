@@ -103,7 +103,7 @@ class MyModel:
         if fname.lower().endswith('.csv'):
             with open(fname, 'wt', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['ID', 'TARGET'])
+                writer.writerow(['id', 'prediction'])
                 for row_id, pred in zip(ids, preds):
                     writer.writerow([row_id, pred])
             return
