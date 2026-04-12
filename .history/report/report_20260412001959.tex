@@ -1,0 +1,90 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+\setlength{\parskip}{3pt}
+\setlength{\parindent}{0pt}
+\pagestyle{empty}
+
+\title{\vspace{-1.5em}CS 489/698: Next-Character Prediction \\ for Interstellar Communication\vspace{-0.5em}}
+\author{Eason Li, YOUR WATERLOOID}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2em}
+
+\section{System Design}
+
+The system predicts the next character in multilingual astronaut--mission-control dialogue using a \textbf{language-routed character n-gram architecture} with four components.
+
+\textbf{Language Identifier.}
+A Naive Bayes classifier over character n-gram features (orders 1--3) identifies each context's language. For scripts with unambiguous Unicode ranges---Arabic, Devanagari, Cyrillic, Hangul---a deterministic shortcut bypasses the classifier. The identifier routes each context to a language-specific prediction model.
+
+\textbf{Per-Language Witten-Bell N-gram Model.}
+For each language, a character n-gram model (orders 1--8) predicts the next character using Witten-Bell interpolation: at order $k$ with total count $T$ and $D$ distinct continuations, the backoff weight is $\lambda = D/(T+D)$, giving $P_k(c \mid h) = \lambda \cdot P_{k-1}(c \mid h') + (1-\lambda) \cdot \text{count}(h,c)/T$. Sparse high-order matches automatically defer to more robust lower orders---a major advantage over selecting only the highest matching order.
+
+\textbf{Multi-Resolution Exact Context Memorization.}
+For each labeled example, the last $L \in \{8, 16, 32, 64\}$ characters of the context map to observed next characters. Longer matches receive exponentially higher weights ($w_L \in \{2, 4, 8, 16\}$), capturing long-range dependencies that n-grams miss.
+
+\textbf{Word-Fragment Completion and Boundary Priors.}
+A word-prefix model maps each partial word to its observed continuations (with case-insensitive fallback). A boundary prior conditions predictions on whether the previous character is a space, letter, digit, or punctuation.
+
+\textbf{Key Design Decisions.}
+(i)~Per-language models prevent cross-language contamination (e.g., Russian frequencies do not dilute English predictions).
+(ii)~Spaces are valid predictions---14.5\% of gold labels are spaces, so prohibiting them creates an irrecoverable ceiling.
+(iii)~Labeled transitions receive $3\times$ weight.
+(iv)~Entirely count-based (no neural components): training ${\sim}$90s, inference ${\sim}$6s for 60K contexts.
+
+\section{Data}
+
+\textbf{Labeled data:} 99,757 (context, next-character) pairs from the competition training set, covering 12+ languages including English, Russian, Arabic, Hindi, Korean, Japanese, Chinese, French, German, and Italian. The data contains 2,085 unique characters spanning Latin, Cyrillic, Arabic, Devanagari, CJK, and Hangul scripts. Context lengths range from 1 to 1,793 characters (median~22). Language metadata associates each example with its source language.
+
+\textbf{Unlabeled data:} 59,744 test contexts are used for self-supervised n-gram training (no labels accessed). Each test context is routed through the language identifier before training, ensuring it contributes to the correct per-language model. No external corpora were used; no filtering or normalization is applied.
+
+\section{Challenges and Problem-Solving}
+
+\textbf{Smoothing quality.}
+Early versions used a ``highest matching order wins'' strategy, where a 10-character n-gram with only 4 counts dominated over a 4-character n-gram with 1,800 counts. Switching to Witten-Bell interpolation, which weights all orders by reliability, improved holdout accuracy by ${\sim}$2--3\%.
+
+\textbf{Cross-language interference.}
+A single-model approach suffered because frequent English characters dominated predictions even for Arabic or Korean contexts. Language-aware routing solved this: each language gets its own n-gram tables and priors. The Naive Bayes identifier adds negligible overhead while substantially improving non-English accuracy.
+
+\textbf{Memory constraints.}
+N-grams at order 8 across 160K multilingual contexts generated millions of keys. Pruning singletons, limiting self-supervised context to 96 characters, and compacting entries to their top-10 continuations reduced the checkpoint to ${\sim}$50\,MB.
+
+\section{Experiments and Results}
+
+All experiments use an 80/20 random holdout split (seed=42). The metric is top-3 accuracy: the prediction is correct if the gold character appears (caseless) in the 3-character prediction string, matching the competition grader.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Holdout Acc.} & \textbf{Key Change} \\
+\midrule
+Baseline (random guess) & ${\sim}3\%$ & Random 3 chars \\
+Bigram (last char $\to$ next) & 50.9\% & Single order \\
+N-gram, highest order only & 85.6\% & Max order=10, no smoothing \\
++ Witten-Bell smoothing & 86.4\% & Interpolation across all orders \\
++ Exact context cache & 86.9\% & Last-50-char memorization \\
++ Word prefix model & 87.0\% & Mid-word completion \\
++ Language routing & 87.8\% & Per-language n-gram tables \\
++ Multi-resolution exact & 88.1\% & $L \in \{8,16,32,64\}$ caches \\
++ Self-sup.\ on test contexts & 88.4\% & Transductive n-gram training \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Ablation.}
+Witten-Bell smoothing provides the single largest gain (+2.5\%). Language routing contributes ${\sim}$0.8\%, primarily improving non-English predictions. Multi-resolution exact caching adds ${\sim}$0.3\% by capturing both short and long recurring patterns. Self-supervised test context training adds ${\sim}$0.3\%.
+
+\textbf{Error analysis.}
+Of holdout errors: ${\sim}$60\% involve non-ASCII characters in languages with sparse training data, ${\sim}$30\% are English characters ranked 4th or lower, and ${\sim}$10\% are very short contexts ($\leq$3 chars) with inherent ambiguity.
+
+\end{document}
